@@ -1,0 +1,106 @@
+name: Orca mobile checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Orca repository (owner/name)
+        required: true
+        default: Astroisback/orca
+      ref:
+        description: Orca branch, tag, or commit SHA to check
+        required: true
+        default: mobile-live-alerts-clean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orca-mobile-checks-${{ inputs.repository }}-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mobile-checks:
+    name: Mobile lint, format, typecheck, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      ORCA_MOBILE_TYPECHECK_COMPILER: bun
+    steps:
+      - name: Checkout Orca
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Record checked-out commit
+        run: git rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup pinned pnpm
+        uses: pnpm/setup@v2
+        with:
+          package-json-file: package.json
+          install: false
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          check-latest: true
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            mobile/pnpm-lock.yaml
+          package-manager-cache: false
+
+      - name: Install root dependencies (script-free)
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Link and verify pinned Bun
+        run: |
+          if [ ! -d node_modules/bun ]; then
+            echo "::error::root bun devDependency was not installed"
+            exit 1
+          fi
+          pnpm rebuild bun
+          test "$(node_modules/.bin/bun --version)" = "$(cat config/.bun-version)"
+          echo "$PWD/node_modules/.bin" >> "$GITHUB_PATH"
+
+      - name: Build @orca/process-host
+        run: pnpm run build:packages
+
+      - name: Install mobile dependencies
+        working-directory: mobile
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint mobile imports
+        run: >
+          node node_modules/oxlint/bin/oxlint
+          --config config/oxlint-code-quality-native-plugins.json
+          mobile --deny-warnings
+
+      - name: Typecheck mobile
+        working-directory: mobile
+        run: >
+          node ../config/scripts/typecheck/project-execution/run-typecheck-projects-in-parallel.mjs
+          --compiler=bun --bun-threads=2 --project=mobile/tsconfig.json
+
+      - name: Typecheck mobile tests (ratchet)
+        working-directory: mobile
+        run: node scripts/check-tests-typecheck-ratchet.mjs
+
+      - name: Test mobile
+        working-directory: mobile
+        env:
+          ORCA_BACKGROUND_LAUNCH: "1"
+        run: node ../config/scripts/mobile-web/check-entry/run-mobile-ci-tests.mjs
+
+      - name: Lint mobile
+        working-directory: mobile
+        run: pnpm lint
+
+      - name: Check mobile formatting
+        working-directory: mobile
+        run: pnpm format:check
